@@ -28,8 +28,12 @@ typedef enum {
     UNKNOWN_MODE = 0,
     DATA_REGISTER_DIRECT,       // Dn
     ADDRESS_REGISTER_DIRECT,    // An
+    // Add these new modes:
+    ADDRESS_REGISTER_INDIRECT,  // (An)
+    ARI_POST_INCREMENT,         // (An)+
+    ARI_PRE_DECREMENT,          // -(An)
+    ARI_DISPLACEMENT,           // d(An)
     IMMEDIATE,                  // #<data>
-    // TODO: Add more addressing modes as needed
 } AddressingMode;
 
 // Represents a parsed operand
@@ -37,6 +41,7 @@ typedef struct {
     AddressingMode mode;
     int reg_num;                // For register modes
     uint32_t value;             // For immediate or absolute address values
+    int16_t displacement;       // Add this for d(An) mode
 } Operand;
 
 // Loads an assembly file into memory

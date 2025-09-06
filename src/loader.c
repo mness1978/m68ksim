@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 #include <ctype.h>
 
 #define HASH_TABLE_SIZE 1024
@@ -186,29 +187,30 @@ int get_instruction_size(const char* opcode_str, const char* operands_str, char*
     if (strcasecmp(base_mnemonic, "BSET") == 0) return 4;
     if (strncasecmp(base_mnemonic, "B", 1) == 0 && strlen(base_mnemonic) > 1) return 2;
 
-
     if (strcasecmp(base_mnemonic, "MOVE") == 0) {
         char temp_operands_str[256];
         if (operands_str) {
             strcpy(temp_operands_str, operands_str);
         } else {
-            temp_operands_str[0] = '\0';
+            temp_operands_str[0] = '\0'; // Should not happen for MOVE
         }
 
+        // We only need to check the source operand to determine the size
         char* src_str = strtok_r(temp_operands_str, ",", saveptr);
-        char* dest_str = strtok_r(NULL, "", saveptr);
-
-        Operand src_op, dest_op;
-        int size = 2; // Base instruction size
-
-        if (src_str && parse_operand(src_str, &src_op) == 0) {
-            size += get_operand_size(&src_op, size_suffix);
-        }
-        if (dest_str && parse_operand(dest_str, &dest_op) == 0) {
-            size += get_operand_size(&dest_op, size_suffix);
-        }
+        Operand src_op;
         
-        return size;
+        if (src_str && parse_operand(src_str, &src_op) == 0) {
+            if (src_op.mode == IMMEDIATE) {
+                // It's MOVE #imm, ...
+                if (size_suffix == 'L') {
+                    return 6; // 2 byte opcode + 4 byte immediate
+                }
+                // For .B and .W, it's 2 byte opcode + 2 byte immediate
+                return 4;
+            }
+        }
+        // If the source is not immediate (e.g., MOVE Dn, Dm), the size is just 2 bytes
+        return 2;
     }
 
     // Default for unsupported instructions in first pass
@@ -220,6 +222,7 @@ void perform_first_pass(FILE* f, uint32_t* start_address) {
     char* line;
     uint32_t current_address = *start_address;
     int symbol_count = 0;
+    bool org_seen = false;
 
     while ((line = read_line_dynamically(f))) {
         char* original_line = line;
@@ -251,13 +254,23 @@ void perform_first_pass(FILE* f, uint32_t* start_address) {
                 if (strcasecmp(opcode_str, "ORG") == 0) {
                     char* operand_str = strtok_r(NULL, "", &saveptr_first_pass);
                     if (operand_str) {
-                        if (operand_str[0] == '$') {
-                            *start_address = strtoul(&operand_str[1], NULL, 16);
-                            current_address = *start_address;
+                        // Add this line to trim the operand string
+                        char* trimmed_operand = trim(operand_str);
+                
+                        uint32_t org_address;
+                        // Use the trimmed_operand variable for parsing
+                        if (trimmed_operand[0] == '$') {
+                            org_address = strtoul(&trimmed_operand[1], NULL, 16);
                         } else {
-                            *start_address = strtoul(operand_str, NULL, 10);
-                            current_address = *start_address;
+                            org_address = strtoul(trimmed_operand, NULL, 10);
                         }
+
+                        // The rest of this logic was correct, no change needed here
+                        if (!org_seen) { // org_seen flag is from the previous fix
+                            *start_address = org_address;
+                            org_seen = true;
+                        }
+                        current_address = org_address;
                     }
                 } else {
                     char* operands_str = strtok_r(NULL, "", &saveptr_first_pass);
@@ -315,10 +328,14 @@ void perform_second_pass(FILE* f, uint32_t start_address) {
         if (strcasecmp(opcode_str, "ORG") == 0) {
             char* operand_str = strtok_r(NULL, "", &saveptr_second_pass);
             if (operand_str) {
-                if (operand_str[0] == '$') {
-                    current_address = strtoul(&operand_str[1], NULL, 16);
+                // Add this line to trim the operand string
+                char* trimmed_operand = trim(operand_str);
+
+                // Use the trimmed_operand variable for parsing
+                if (trimmed_operand[0] == '$') {
+                    current_address = strtoul(&trimmed_operand[1], NULL, 16);
                 } else {
-                    current_address = strtoul(operand_str, NULL, 10);
+                    current_address = strtoul(trimmed_operand, NULL, 10);
                 }
             }
             free(original_line);
@@ -496,10 +513,19 @@ void perform_second_pass(FILE* f, uint32_t start_address) {
             Operand src_op, dest_op;
             if (parse_operand(src_str, &src_op) != 0 || parse_operand(dest_str, &dest_op) != 0) {
                 fprintf(stderr, "L%d: Error: Invalid operands for BTST\n", line_number);
-            } else {
-                uint16_t machine_code = 0x0800 | (dest_op.reg_num << 9) | src_op.reg_num;
+            } else if (src_op.mode == IMMEDIATE && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BTST #imm, Dn
+                uint16_t machine_code = 0x0800 | dest_op.reg_num;
+                mem_write_word(current_address, machine_code);
+                mem_write_word(current_address + 2, src_op.value);
+                current_address += 4;
+            } else if (src_op.mode == DATA_REGISTER_DIRECT && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BTST Dn, Dm
+                uint16_t machine_code = 0x0100 | (src_op.reg_num << 9) | dest_op.reg_num;
                 mem_write_word(current_address, machine_code);
                 current_address += 2;
+            } else {
+                fprintf(stderr, "L%d: Error: Unsupported operand combination for BTST\n", line_number);
             }
         } else if (strcasecmp(base_mnemonic, "BCHG") == 0) {
             char* src_str = strtok_r(operands_str, ",", &saveptr_second_pass);
@@ -507,10 +533,19 @@ void perform_second_pass(FILE* f, uint32_t start_address) {
             Operand src_op, dest_op;
             if (parse_operand(src_str, &src_op) != 0 || parse_operand(dest_str, &dest_op) != 0) {
                 fprintf(stderr, "L%d: Error: Invalid operands for BCHG\n", line_number);
-            } else {
-                uint16_t machine_code = 0x0840 | (dest_op.reg_num << 9) | src_op.reg_num;
+            } else if (src_op.mode == IMMEDIATE && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BCHG #imm, Dn
+                uint16_t machine_code = 0x0840 | dest_op.reg_num;
+                mem_write_word(current_address, machine_code);
+                mem_write_word(current_address + 2, src_op.value);
+                current_address += 4;
+            } else if (src_op.mode == DATA_REGISTER_DIRECT && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BCHG Dn, Dm
+                uint16_t machine_code = 0x0140 | (src_op.reg_num << 9) | dest_op.reg_num;
                 mem_write_word(current_address, machine_code);
                 current_address += 2;
+            } else {
+                fprintf(stderr, "L%d: Error: Unsupported operand combination for BCHG\n", line_number);
             }
         } else if (strcasecmp(base_mnemonic, "BCLR") == 0) {
             char* src_str = strtok_r(operands_str, ",", &saveptr_second_pass);
@@ -518,10 +553,19 @@ void perform_second_pass(FILE* f, uint32_t start_address) {
             Operand src_op, dest_op;
             if (parse_operand(src_str, &src_op) != 0 || parse_operand(dest_str, &dest_op) != 0) {
                 fprintf(stderr, "L%d: Error: Invalid operands for BCLR\n", line_number);
-            } else {
-                uint16_t machine_code = 0x0880 | (dest_op.reg_num << 9) | src_op.reg_num;
+            } else if (src_op.mode == IMMEDIATE && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BCLR #imm, Dn
+                uint16_t machine_code = 0x0880 | dest_op.reg_num;
+                mem_write_word(current_address, machine_code);
+                mem_write_word(current_address + 2, src_op.value);
+                current_address += 4;
+            } else if (src_op.mode == DATA_REGISTER_DIRECT && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BCLR Dn, Dm
+                uint16_t machine_code = 0x0180 | (src_op.reg_num << 9) | dest_op.reg_num;
                 mem_write_word(current_address, machine_code);
                 current_address += 2;
+            } else {
+                fprintf(stderr, "L%d: Error: Unsupported operand combination for BCLR\n", line_number);
             }
         } else if (strcasecmp(base_mnemonic, "BSET") == 0) {
             char* src_str = strtok_r(operands_str, ",", &saveptr_second_pass);
@@ -529,10 +573,19 @@ void perform_second_pass(FILE* f, uint32_t start_address) {
             Operand src_op, dest_op;
             if (parse_operand(src_str, &src_op) != 0 || parse_operand(dest_str, &dest_op) != 0) {
                 fprintf(stderr, "L%d: Error: Invalid operands for BSET\n", line_number);
-            } else {
-                uint16_t machine_code = 0x08C0 | (dest_op.reg_num << 9) | src_op.reg_num;
+            } else if (src_op.mode == IMMEDIATE && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BSET #imm, Dn
+                uint16_t machine_code = 0x08C0 | dest_op.reg_num;
+                mem_write_word(current_address, machine_code);
+                mem_write_word(current_address + 2, src_op.value);
+                current_address += 4;
+            } else if (src_op.mode == DATA_REGISTER_DIRECT && dest_op.mode == DATA_REGISTER_DIRECT) {
+                // Correctly handles: BSET Dn, Dm
+                uint16_t machine_code = 0x01C0 | (src_op.reg_num << 9) | dest_op.reg_num;
                 mem_write_word(current_address, machine_code);
                 current_address += 2;
+            } else {
+                fprintf(stderr, "L%d: Error: Unsupported operand combination for BSET\n", line_number);
             }
         } else if (strcasecmp(base_mnemonic, "ADD") == 0) {
             uint16_t size_bits;

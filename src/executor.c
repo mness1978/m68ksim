@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <stdbool.h>
 
-#define MAX_EXECUTION_CYCLES 50 // Safety break to prevent infinite loops
+#define MAX_EXECUTION_CYCLES 5000 // Safety break to prevent infinite loops
 
 // Helper to set/clear status register flags
 void set_sr_flag(CPU* cpu, int flag, bool set) {
@@ -80,12 +80,35 @@ void execute_program(CPU* cpu) {
         cpu->pc += 2;
 
         // Decode and execute
-        if (opcode == 0x303C) { // MOVE.W #imm,D0
-            uint16_t data = mem_read_word(cpu->pc);
-            cpu->pc += 2;
-            cpu->d[0] = (cpu->d[0] & 0xFFFF0000) | data;
-            set_sr_flag(cpu, SR_Z, data == 0);
-        } else if (opcode == 0x4E71) { // NOP
+        if ((opcode & 0xC1FF) == 0x003C) { // Correctly detects MOVE.B/W/L #imm, Dn
+            int size_field = (opcode >> 12) & 0x3; // 1=Byte, 3=Word, 2=Long
+            int reg_num = (opcode >> 9) & 0x7;
+
+            // Flags V and C are always cleared for MOVE
+            set_sr_flag(cpu, SR_V, false);
+            set_sr_flag(cpu, SR_C, false);
+
+            if (size_field == 1) { // Byte (size bits are 01)
+                // Immediate byte is stored in the low byte of the following word
+                uint8_t data = mem_read_word(cpu->pc) & 0xFF;
+                cpu->pc += 2;
+                cpu->d[reg_num] = (cpu->d[reg_num] & 0xFFFFFF00) | data;
+                set_sr_flag(cpu, SR_Z, data == 0);
+                set_sr_flag(cpu, SR_N, (data & 0x80) != 0);
+            } else if (size_field == 3) { // Word (size bits are 11)
+                uint16_t data = mem_read_word(cpu->pc);
+                cpu->pc += 2;
+                cpu->d[reg_num] = (cpu->d[reg_num] & 0xFFFF0000) | data;
+                set_sr_flag(cpu, SR_Z, data == 0);
+                set_sr_flag(cpu, SR_N, (data & 0x8000) != 0);
+            } else if (size_field == 2) { // Long (size bits are 10)
+                uint32_t data = mem_read_long(cpu->pc);
+                cpu->pc += 4;
+                cpu->d[reg_num] = data;
+                set_sr_flag(cpu, SR_Z, data == 0);
+                set_sr_flag(cpu, SR_N, (data & 0x80000000) != 0);
+            }
+		} else if (opcode == 0x4E71) { // NOP
             // Do nothing.
         } else if ((opcode & 0xF138) == 0x5100) { // SUBQ #imm,Dn
             int data = (opcode >> 9) & 0x7;
@@ -145,22 +168,59 @@ void execute_program(CPU* cpu) {
                 cpu->d[reg_num] = result;
                 set_flags(cpu, data, reg_val, result, 2, true);
             }
-        } else if ((opcode & 0xF1C0) == 0x90C0) { // SUB.W Dm,Dn
+
+        } else if ((opcode & 0xF038) == 0x9000) { // Catches SUB.B/W/L Dm, Dn
             int src_reg = opcode & 0x7;
             int dest_reg = (opcode >> 9) & 0x7;
-            uint16_t src_val = cpu->d[src_reg] & 0xFFFF;
-            uint16_t dest_val = cpu->d[dest_reg] & 0xFFFF;
-            uint32_t result = dest_val - src_val;
-            cpu->d[dest_reg] = (cpu->d[dest_reg] & 0xFFFF0000) | (result & 0xFFFF);
-            set_flags(cpu, src_val, dest_val, result, 1, true);
-        } else if ((opcode & 0xF1F8) == 0xD060) { // ADD.W Dn,Dm
+            int size_field = (opcode >> 6) & 0x7; // 000=Byte, 001=Word, 010=Long
+
+            uint32_t src_val = cpu->d[src_reg];
+            uint32_t dest_val = cpu->d[dest_reg];
+            uint32_t result;
+
+            if (size_field == 0) { // Byte
+                uint8_t s = src_val & 0xFF;
+                uint8_t d = dest_val & 0xFF;
+                result = d - s;
+                cpu->d[dest_reg] = (dest_val & 0xFFFFFF00) | (result & 0xFF);
+                set_flags(cpu, s, d, result, 0, true);
+            } else if (size_field == 1) { // Word
+                uint16_t s = src_val & 0xFFFF;
+                uint16_t d = dest_val & 0xFFFF;
+                result = d - s;
+                cpu->d[dest_reg] = (dest_val & 0xFFFF0000) | (result & 0xFFFF);
+                set_flags(cpu, s, d, result, 1, true);
+            } else if (size_field == 2) { // Long
+                result = dest_val - src_val;
+                cpu->d[dest_reg] = result;
+                set_flags(cpu, src_val, dest_val, result, 2, true);
+            }
+        } else if ((opcode & 0xF038) == 0xD000) { // ADD Dm, Dn
             int src_reg = opcode & 0x7;
             int dest_reg = (opcode >> 9) & 0x7;
-            uint16_t src_val = cpu->d[src_reg] & 0xFFFF;
-            uint16_t dest_val = cpu->d[dest_reg] & 0xFFFF;
-            uint32_t result = dest_val + src_val;
-            cpu->d[dest_reg] = (cpu->d[dest_reg] & 0xFFFF0000) | (result & 0xFFFF);
-            set_flags(cpu, src_val, dest_val, result, 1, false);
+            int opmode = (opcode >> 6) & 0x7; // opmode: 000=B, 001=W, 010=L
+            
+            uint32_t src_val = cpu->d[src_reg];
+            uint32_t dest_val = cpu->d[dest_reg];
+            uint32_t result;
+
+            if (opmode == 0) { // Byte
+                uint8_t s = src_val & 0xFF;
+                uint8_t d = dest_val & 0xFF;
+                result = d + s;
+                cpu->d[dest_reg] = (dest_val & 0xFFFFFF00) | (result & 0xFF);
+                set_flags(cpu, s, d, result, 0, false);
+            } else if (opmode == 1) { // Word
+                uint16_t s = src_val & 0xFFFF;
+                uint16_t d = dest_val & 0xFFFF;
+                result = d + s;
+                cpu->d[dest_reg] = (dest_val & 0xFFFF0000) | (result & 0xFFFF);
+                set_flags(cpu, s, d, result, 1, false);
+            } else if (opmode == 2) { // Long
+                result = dest_val + src_val;
+                cpu->d[dest_reg] = result;
+                set_flags(cpu, src_val, dest_val, result, 2, false);
+            }
         } else if ((opcode & 0xF138) == 0x5000) { // ADDQ #imm,Dn
             int data = (opcode >> 9) & 0x7;
             if (data == 0) data = 8;
@@ -355,7 +415,7 @@ void execute_program(CPU* cpu) {
             if (branch) {
                 // The displacement is relative to the current PC, which is the address
                 // of the instruction *after* the branch instruction.
-                cpu->pc += displacement;
+                cpu->pc = current_pc + 2 + displacement;
             }
         } else if (opcode == 0x4E75) { // RTS
             running = false;
