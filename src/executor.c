@@ -63,6 +63,105 @@ void set_logic_flags(CPU* cpu, uint32_t result, int size_code) {
     }
 }
 
+// Resolves an effective address, returns the final address, and handles pre/post operations
+uint32_t resolve_ea(CPU* cpu, uint8_t ea_field, int size_code) {
+    uint8_t mode = (ea_field >> 3) & 0x7;
+    uint8_t reg = ea_field & 0x7;
+    uint32_t address;
+    int increment = 0;
+
+    if (size_code == 0) increment = 1; // Byte
+    else if (size_code == 1) increment = 2; // Word
+    else increment = 4; // Long
+    if (reg == 7 && (mode == 3 || mode == 4)) { // A7 with pre/post is always 2 for byte
+        if (size_code == 0) increment = 2;
+    }
+    switch (mode) {
+        case 2: // (An)
+            return cpu->a[reg];
+        case 3: // (An)+
+            address = cpu->a[reg];
+            cpu->a[reg] += increment;
+            return address;
+        case 4: // -(An)
+            cpu->a[reg] -= increment;
+            return cpu->a[reg];
+        case 5: // d16(An)
+            {
+                int16_t displacement = (int16_t)mem_read_word(cpu->pc);
+                cpu->pc += 2;
+                return cpu->a[reg] + displacement;
+            }
+    }
+    return 0; // Should not happen for these modes
+}
+
+// Reads a value from an effective address
+uint32_t read_from_ea(CPU* cpu, uint8_t ea_field, int size_code) {
+    uint8_t mode = (ea_field >> 3) & 0x7;
+    uint8_t reg = ea_field & 0x7;
+
+    // The special EA field for Immediate is Mode=7, Reg=4
+	if (mode == 7 && reg == 4) { // Immediate
+        uint32_t data;
+        if (size_code == 2) { // Long
+            data = mem_read_long(cpu->pc);
+            cpu->pc += 4;
+        } else { // Byte or Word
+            data = mem_read_word(cpu->pc);
+            cpu->pc += 2;
+        }
+		return data; // Return the full data read
+    }
+
+    switch (mode) {
+        case 0: // Dn
+            return cpu->d[reg];
+        case 1: // An
+            return cpu->a[reg];
+        default: // All other memory-based modes
+            {
+                uint32_t address = resolve_ea(cpu, ea_field, size_code);
+                if (size_code == 0) return mem_read_byte(address);
+                if (size_code == 1) return mem_read_word(address);
+                return mem_read_long(address);
+            }
+    }
+}
+
+// Writes a value to an effective addres
+void write_to_ea(CPU* cpu, uint8_t ea_field, uint32_t value, int size_code) {
+    uint8_t mode = (ea_field >> 3) & 0x7;
+    uint8_t reg = ea_field & 0x7;
+
+    switch (mode) {
+        case 0: // Dn - Data Register Direct
+            if (size_code == 0) { // Byte
+                cpu->d[reg] = (cpu->d[reg] & 0xFFFFFF00) | (value & 0xFF);
+            } else if (size_code == 1) { // Word
+                cpu->d[reg] = (cpu->d[reg] & 0xFFFF0000) | (value & 0xFFFF);
+            } else { // Long
+                cpu->d[reg] = value;
+            }
+            break;
+        case 1: // An - Address Register Direct
+            if (size_code == 1) { // Word
+                // Word writes to An are sign-extended to 32 bits
+                cpu->a[reg] = (int32_t)(int16_t)value;
+            } else { // Long
+                cpu->a[reg] = value;
+            }
+            break;
+        default: // All other memory-based modes
+            {
+                uint32_t address = resolve_ea(cpu, ea_field, size_code);
+                if (size_code == 0) mem_write_byte(address, value);
+                else if (size_code == 1) mem_write_word(address, value);
+                else mem_write_long(address, value);
+            }
+    }
+}
+
 void execute_program(CPU* cpu) {
     printf("INFO: Beginning execution from 0x%X.\n\n", cpu->pc);
     bool running = true;
@@ -79,36 +178,56 @@ void execute_program(CPU* cpu) {
         uint16_t opcode = mem_read_word(cpu->pc);
         cpu->pc += 2;
 
-        // Decode and execute
-        if ((opcode & 0xC1FF) == 0x003C) { // Correctly detects MOVE.B/W/L #imm, Dn
-            int size_field = (opcode >> 12) & 0x3; // 1=Byte, 3=Word, 2=Long
-            int reg_num = (opcode >> 9) & 0x7;
-
-            // Flags V and C are always cleared for MOVE
+        // Handler for MOVE.B
+        if ((opcode & 0xF000) == 0x1000) {
+            uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
+            uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
+            uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
+            uint8_t src_ea = opcode & 0x3F;
+            uint32_t value = read_from_ea(cpu, src_ea, 0); // 0=Byte
+            write_to_ea(cpu, dest_ea, value, 0);
             set_sr_flag(cpu, SR_V, false);
             set_sr_flag(cpu, SR_C, false);
+            set_logic_flags(cpu, value, 0);
+        
+        // Handler for MOVE.L and MOVEA.L
+        } else if ((opcode & 0xF000) == 0x2000) {
+            uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
+            uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
+            uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
+            uint8_t src_ea = opcode & 0x3F;
+            uint32_t value = read_from_ea(cpu, src_ea, 2); // 2=Long
 
-            if (size_field == 1) { // Byte (size bits are 01)
-                // Immediate byte is stored in the low byte of the following word
-                uint8_t data = mem_read_word(cpu->pc) & 0xFF;
-                cpu->pc += 2;
-                cpu->d[reg_num] = (cpu->d[reg_num] & 0xFFFFFF00) | data;
-                set_sr_flag(cpu, SR_Z, data == 0);
-                set_sr_flag(cpu, SR_N, (data & 0x80) != 0);
-            } else if (size_field == 3) { // Word (size bits are 11)
-                uint16_t data = mem_read_word(cpu->pc);
-                cpu->pc += 2;
-                cpu->d[reg_num] = (cpu->d[reg_num] & 0xFFFF0000) | data;
-                set_sr_flag(cpu, SR_Z, data == 0);
-                set_sr_flag(cpu, SR_N, (data & 0x8000) != 0);
-            } else if (size_field == 2) { // Long (size bits are 10)
-                uint32_t data = mem_read_long(cpu->pc);
-                cpu->pc += 4;
-                cpu->d[reg_num] = data;
-                set_sr_flag(cpu, SR_Z, data == 0);
-                set_sr_flag(cpu, SR_N, (data & 0x80000000) != 0);
+            if (dest_ea_mode == 1) { // Destination is An (MOVEA.L)
+                write_to_ea(cpu, dest_ea, value, 2);
+                // MOVEA does not affect flags
+            } else { // Destination is not An (MOVE.L)
+                write_to_ea(cpu, dest_ea, value, 2);
+                set_sr_flag(cpu, SR_V, false);
+                set_sr_flag(cpu, SR_C, false);
+                set_logic_flags(cpu, value, 2);
             }
-		} else if (opcode == 0x4E71) { // NOP
+
+        // Handler for MOVE.W and MOVEA.W
+        } else if ((opcode & 0xF000) == 0x3000) {
+            uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
+            uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
+            uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
+            uint8_t src_ea = opcode & 0x3F;
+            uint32_t value = read_from_ea(cpu, src_ea, 1); // 1=Word
+
+            if (dest_ea_mode == 1) { // Destination is An (MOVEA.W)
+                // Word moves to An are sign-extended, so write as Long
+                write_to_ea(cpu, dest_ea, (int32_t)(int16_t)value, 2);
+                // MOVEA does not affect flags
+            } else { // Destination is not An (MOVE.W)
+				write_to_ea(cpu, dest_ea, value, 1);
+                set_sr_flag(cpu, SR_V, false);
+                set_sr_flag(cpu, SR_C, false);
+                set_logic_flags(cpu, value, 1);
+            }
+
+        } else if (opcode == 0x4E71) { // NOP
             // Do nothing.
         } else if ((opcode & 0xF138) == 0x5100) { // SUBQ #imm,Dn
             int data = (opcode >> 9) & 0x7;
@@ -352,7 +471,39 @@ void execute_program(CPU* cpu) {
             set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
             
             cpu->d[reg_num] = reg_val | mask;
-        } else if ((opcode & 0xF000) == 0x6000) { // Bcc
+        } else if ((opcode & 0xC000) == 0x0000) { // Catches MOVE.B/W/L (but not MOVEA)
+            uint16_t size_bits = (opcode >> 12) & 0x3; // 1=B, 3=W, 2=L
+            int size_code = -1;
+            if (size_bits == 1) size_code = 0; // Byte
+            if (size_bits == 3) size_code = 1; // Word
+            if (size_bits == 2) size_code = 2; // Long
+
+            if (size_code != -1) {
+                uint8_t src_ea = opcode & 0x3F;
+                uint8_t dest_ea = ((opcode >> 6) & 0x7) | (((opcode >> 9) & 0x7) << 3);
+
+                // Note: Immediate source is NOT handled by this instruction format.
+                // It's handled by specific instructions like ADDI, SUBI, ANDI, etc.
+                // Or by MOVE #imm which is a different pattern.
+                // Let's ensure this handler doesn't run for immediate sources.
+                if (src_ea != 0b111100) {
+                    uint32_t value = read_from_ea(cpu, src_ea, size_code);
+                    write_to_ea(cpu, dest_ea, value, size_code);
+                    
+                    set_sr_flag(cpu, SR_V, false);
+                    set_sr_flag(cpu, SR_C, false);
+                    set_logic_flags(cpu, value, size_code);
+                } else {
+                    // This case indicates an immediate instruction that we should have caught earlier.
+                    // If we get here, it means we have a bug in our instruction ordering or masks.
+                    printf("WARN: Unhandled immediate-style opcode: %04X\n", opcode);
+                    running = false;
+                }
+            } else {
+                 printf("WARN: Unimplemented MOVE variant: %04X\n", opcode);
+                 running = false;
+            }
+		} else if ((opcode & 0xF000) == 0x6000) { // Bcc
             int condition = (opcode >> 8) & 0xF;
             int8_t displacement = opcode & 0xFF;
             bool branch = false;

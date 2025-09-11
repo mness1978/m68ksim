@@ -119,22 +119,25 @@ void parse_instruction_mnemonic(const char* opcode_str, char* base, char* size) 
 // Parses a string to determine the addressing mode and extract operands.
 // Returns 0 on success, -1 on failure.
 int parse_operand(const char* str, Operand* operand) {
-    if (!str || !operand) return -1;
+	int reg;
+	int16_t disp;
+
+	if (!str || !operand) return -1;
 
     char* trimmed_str = trim((char*)str);
     memset(operand, 0, sizeof(Operand));
 
     // Data Register Direct: Dn
-    if (toupper(trimmed_str[0]) == 'D' && isdigit(trimmed_str[1]) && trimmed_str[2] == '\0') {
+    if (sscanf(trimmed_str, "D%d", &reg) == 1 && trimmed_str[2] == '\0') {
         operand->mode = DATA_REGISTER_DIRECT;
-        operand->reg_num = trimmed_str[1] - '0';
+        operand->reg_num = reg;
         return 0;
     }
 
     // Address Register Direct: An
-    if (toupper(trimmed_str[0]) == 'A' && isdigit(trimmed_str[1]) && trimmed_str[2] == '\0') {
+    if (sscanf(trimmed_str, "A%d", &reg) == 1 && trimmed_str[2] == '\0') {
         operand->mode = ADDRESS_REGISTER_DIRECT;
-        operand->reg_num = trimmed_str[1] - '0';
+        operand->reg_num = reg;
         return 0;
     }
 
@@ -147,6 +150,37 @@ int parse_operand(const char* str, Operand* operand) {
         } else { // Decimal
             operand->value = strtoul(value_str, NULL, 10);
         }
+        return 0;
+    }
+
+    // Check for the most specific patterns first.
+
+    // Pre-decrement: -(An)
+    if (sscanf(trimmed_str, "-(A%d)", &reg) == 1 && trimmed_str[5] == '\0') {
+        operand->mode = ARI_PRE_DECREMENT;
+        operand->reg_num = reg;
+        return 0;
+    }
+  
+    // Post-increment: (An)+
+    if (sscanf(trimmed_str, "(A%d)+", &reg) == 1 && trimmed_str[4] == '+') {
+		operand->mode = ARI_POST_INCREMENT;
+        operand->reg_num = reg;
+        return 0;
+    }
+    
+    // Displacement: d(An)
+    if (sscanf(trimmed_str, "%hd(A%d)", &disp, &reg) == 2) {
+        operand->mode = ARI_DISPLACEMENT;
+        operand->reg_num = reg;
+        operand->displacement = disp;
+        return 0;
+    }
+
+    // Basic Indirect: (An) - This must be checked LAST.
+    if (sscanf(trimmed_str, "(A%d)", &reg) == 1) {
+        operand->mode = ADDRESS_REGISTER_INDIRECT;
+        operand->reg_num = reg;
         return 0;
     }
 
@@ -166,55 +200,69 @@ int get_operand_size(Operand* op, char size_suffix) {
 }
 
 // Determines the size of an instruction based on its mnemonic and operands.
-// This is a simplified version for the first pass.
 int get_instruction_size(const char* opcode_str, const char* operands_str, char** saveptr) {
     char base_mnemonic[10];
     char size_suffix;
     parse_instruction_mnemonic(opcode_str, base_mnemonic, &size_suffix);
 
+    // Fixed-size instructions
     if (strcasecmp(base_mnemonic, "NOP") == 0) return 2;
     if (strcasecmp(base_mnemonic, "RTS") == 0) return 2;
-    if (strcasecmp(base_mnemonic, "JMP") == 0) return 6; // JMP always 6 for now (absolute long)
-    if (strcasecmp(base_mnemonic, "BNE") == 0) return 2; // BNE is always 2 (short branch)
-    if (strcasecmp(base_mnemonic, "SUBQ") == 0) return 2; // SUBQ is always 2
+    if (strncasecmp(base_mnemonic, "B", 1) == 0 && strlen(base_mnemonic) > 1) return 2;
+    if (strcasecmp(base_mnemonic, "SUBQ") == 0) return 2;
     if (strcasecmp(base_mnemonic, "ADDQ") == 0) return 2;
+    
+    // Instructions with variable size based on immediate data
     if (strcasecmp(base_mnemonic, "ADDI") == 0) return (size_suffix == 'L') ? 6 : 4;
     if (strcasecmp(base_mnemonic, "SUBI") == 0) return (size_suffix == 'L') ? 6 : 4;
     if (strcasecmp(base_mnemonic, "ANDI") == 0) return (size_suffix == 'L') ? 6 : 4;
-    if (strcasecmp(base_mnemonic, "BTST") == 0) return 4;
-    if (strcasecmp(base_mnemonic, "BCHG") == 0) return 4;
-    if (strcasecmp(base_mnemonic, "BCLR") == 0) return 4;
-    if (strcasecmp(base_mnemonic, "BSET") == 0) return 4;
-    if (strncasecmp(base_mnemonic, "B", 1) == 0 && strlen(base_mnemonic) > 1) return 2;
-
-    if (strcasecmp(base_mnemonic, "MOVE") == 0) {
-        char temp_operands_str[256];
-        if (operands_str) {
-            strcpy(temp_operands_str, operands_str);
-        } else {
-            temp_operands_str[0] = '\0'; // Should not happen for MOVE
-        }
-
-        // We only need to check the source operand to determine the size
-        char* src_str = strtok_r(temp_operands_str, ",", saveptr);
+    
+    // Bit manipulation instructions
+    if (strcasecmp(base_mnemonic, "BTST") == 0 || strcasecmp(base_mnemonic, "BCHG") == 0 ||
+        strcasecmp(base_mnemonic, "BCLR") == 0 || strcasecmp(base_mnemonic, "BSET") == 0) {
+        char temp_operands[100]; strcpy(temp_operands, operands_str);
+        char* src_str = strtok_r(temp_operands, ",", saveptr);
         Operand src_op;
-        
-        if (src_str && parse_operand(src_str, &src_op) == 0) {
-            if (src_op.mode == IMMEDIATE) {
-                // It's MOVE #imm, ...
-                if (size_suffix == 'L') {
-                    return 6; // 2 byte opcode + 4 byte immediate
-                }
-                // For .B and .W, it's 2 byte opcode + 2 byte immediate
-                return 4;
-            }
-        }
-        // If the source is not immediate (e.g., MOVE Dn, Dm), the size is just 2 bytes
+        if (src_str && parse_operand(src_str, &src_op) == 0 && src_op.mode == IMMEDIATE) return 4;
         return 2;
     }
 
-    // Default for unsupported instructions in first pass
-    return 2;
+    if (strcasecmp(base_mnemonic, "MOVE") == 0) {
+        int size = 2; // Base opcode word
+        char temp_operands[100]; strcpy(temp_operands, operands_str);
+        char* src_str = strtok_r(temp_operands, ",", saveptr);
+        char* dest_str = strtok_r(NULL, "", saveptr);
+        Operand src_op, dest_op;
+
+        if (src_str && parse_operand(src_str, &src_op) == 0) {
+            if (src_op.mode == IMMEDIATE) size += (size_suffix == 'L') ? 4 : 2;
+            else if (src_op.mode == ARI_DISPLACEMENT) size += 2;
+        }
+        if (dest_str && parse_operand(dest_str, &dest_op) == 0) {
+            if (dest_op.mode == ARI_DISPLACEMENT) size += 2;
+        }
+        return size;
+    }
+
+    return 2; // Default
+}
+
+// Helper to encode an operand into its 6-bit Effective Address field
+uint8_t encode_ea(Operand* op) {
+    uint8_t mode = 0;
+    uint8_t reg = op->reg_num;
+
+    switch (op->mode) {
+        case DATA_REGISTER_DIRECT:      mode = 0b000; break;
+        case ADDRESS_REGISTER_DIRECT:   mode = 0b001; break;
+        case ADDRESS_REGISTER_INDIRECT: mode = 0b010; break;
+        case ARI_POST_INCREMENT:        mode = 0b011; break;
+        case ARI_PRE_DECREMENT:         mode = 0b100; break;
+        case ARI_DISPLACEMENT:          mode = 0b101; break;
+        case IMMEDIATE:                 mode = 0b111; reg = 0b100; break;
+        default: break; // Should not be reached for valid EA modes
+    }
+    return (mode << 3) | reg;
 }
 
 // First pass: find all labels and record their addresses
@@ -355,37 +403,58 @@ void perform_second_pass(FILE* f, uint32_t start_address) {
             mem_write_word(current_address, 0x4E75);
             current_address += 2;
         } else if (strcasecmp(base_mnemonic, "MOVE") == 0) {
-            uint16_t size_bits;
-            if (size_suffix == 'B') size_bits = 0x1000;
-            else if (size_suffix == 'L') size_bits = 0x2000;
-            else size_bits = 0x3000; // .W
-
             char* src_str = strtok_r(operands_str, ",", &saveptr_second_pass);
             char* dest_str = strtok_r(NULL, "", &saveptr_second_pass);
             Operand src_op, dest_op;
 
             if (parse_operand(src_str, &src_op) != 0 || parse_operand(dest_str, &dest_op) != 0) {
                 fprintf(stderr, "L%d: Error: Invalid operands for MOVE\n", line_number);
+            } else if (src_op.mode == IMMEDIATE && dest_op.mode == ADDRESS_REGISTER_DIRECT) {
+                // This is actually the MOVEA instruction: MOVEA #imm, An
+                uint16_t machine_code;
+                if (size_suffix == 'L') {
+                    machine_code = 0x207C | (dest_op.reg_num << 9); // MOVEA.L #imm, An
+                    mem_write_word(current_address, machine_code);
+                    mem_write_long(current_address + 2, src_op.value);
+                    current_address += 6;
+                } else { // Word
+                    machine_code = 0x307C | (dest_op.reg_num << 9); // MOVEA.W #imm, An
+                    mem_write_word(current_address, machine_code);
+                    mem_write_word(current_address + 2, src_op.value);
+                    current_address += 4;
+                }
             } else {
-                uint16_t machine_code = size_bits;
-                // Simplified encoder, assumes dest is Dn
-                machine_code |= (dest_op.reg_num << 9);
+                // This handles all other MOVE instructions
+                uint16_t size_bits;
+                if (size_suffix == 'B') size_bits = 0x1;
+                else if (size_suffix == 'L') size_bits = 0x2;
+                else size_bits = 0x3; // Word
+
+                uint16_t dest_ea = encode_ea(&dest_op);
+                uint16_t src_ea = encode_ea(&src_op);
+                uint16_t machine_code = (size_bits << 12) | ((dest_ea & 0b111) << 9) | ((dest_ea >> 3) << 6) | src_ea;
+                
+                mem_write_word(current_address, machine_code);
+                current_address += 2;
+
+                // If the source was immediate, we need to write its value now.
                 if (src_op.mode == IMMEDIATE) {
-                    machine_code |= 0x003C;
-                    mem_write_word(current_address, machine_code);
                     if (size_suffix == 'L') {
-                        mem_write_long(current_address + 2, src_op.value);
-                        current_address += 6;
-                    } else {
-                        mem_write_word(current_address + 2, src_op.value);
+                        mem_write_long(current_address, src_op.value);
                         current_address += 4;
+                    } else { // Word or Byte
+                        mem_write_word(current_address, src_op.value);
+                        current_address += 2;
                     }
-                } else if (src_op.mode == DATA_REGISTER_DIRECT) {
-                    machine_code |= src_op.reg_num;
-                    mem_write_word(current_address, machine_code);
+                }
+
+                if (src_op.mode == ARI_DISPLACEMENT) {
+                    mem_write_word(current_address, src_op.displacement);
                     current_address += 2;
-                } else {
-                    fprintf(stderr, "L%d: Error: Unsupported source operand for MOVE\n", line_number);
+                }
+                if (dest_op.mode == ARI_DISPLACEMENT) {
+                    mem_write_word(current_address, dest_op.displacement);
+                    current_address += 2;
                 }
             }
         } else if (strcasecmp(base_mnemonic, "SUBQ") == 0) {
