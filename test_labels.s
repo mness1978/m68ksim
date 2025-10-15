@@ -1,0 +1,7 @@
+START:
+    NOP
+LOOP:
+    NOP
+    JMP LOOP
+END:
+    RTS

@@ -6,6 +6,49 @@
 
 #define MAX_EXECUTION_CYCLES 5000 // Safety break to prevent infinite loops
 
+// --- Forward declarations for instruction handler functions ---
+static void handle_move_b(CPU* cpu, uint16_t opcode);
+static void handle_move_l(CPU* cpu, uint16_t opcode);
+static void handle_move_w(CPU* cpu, uint16_t opcode);
+static void handle_subq(CPU* cpu, uint16_t opcode);
+static void handle_subi(CPU* cpu, uint16_t opcode);
+static void handle_sub_reg(CPU* cpu, uint16_t opcode);
+static void handle_add_reg(CPU* cpu, uint16_t opcode);
+static void handle_addq(CPU* cpu, uint16_t opcode);
+static void handle_addi(CPU* cpu, uint16_t opcode);
+static void handle_andi(CPU* cpu, uint16_t opcode);
+static void handle_btst_imm(CPU* cpu, uint16_t opcode);
+static void handle_bchg_imm(CPU* cpu, uint16_t opcode);
+static void handle_bclr_imm(CPU* cpu, uint16_t opcode);
+static void handle_bset_imm(CPU* cpu, uint16_t opcode);
+static void handle_bcc(CPU* cpu, uint16_t opcode);
+static void handle_nop(CPU* cpu, uint16_t opcode);
+static void handle_rts(CPU* cpu, uint16_t opcode);
+
+// --- Opcode to Handler Lookup Table ---
+// The order is important! More specific masks must come before more general ones.
+static const OpcodeMapping instruction_table[] = {
+    { 0xFFF8, 0x0800, handle_btst_imm }, // BTST #imm,Dn
+    { 0xFFF8, 0x0840, handle_bchg_imm }, // BCHG #imm,Dn
+    { 0xFFF8, 0x0880, handle_bclr_imm }, // BCLR #imm,Dn
+    { 0xFFF8, 0x08C0, handle_bset_imm }, // BSET #imm,Dn
+    { 0xFF38, 0x0200, handle_andi },     // ANDI #<data>,Dn
+    { 0xFF38, 0x0400, handle_subi },     // SUBI #<data>,Dn
+    { 0xFF38, 0x0600, handle_addi },     // ADDI #<data>,Dn
+    { 0xF138, 0x5000, handle_addq },     // ADDQ #imm,Dn
+    { 0xF138, 0x5100, handle_subq },     // SUBQ #imm,Dn
+    { 0xF000, 0x1000, handle_move_b },   // MOVE.B
+    { 0xF000, 0x2000, handle_move_l },   // MOVE.L / MOVEA.L
+    { 0xF000, 0x3000, handle_move_w },   // MOVE.W / MOVEA.W
+    { 0xF000, 0x6000, handle_bcc },      // Bcc
+    { 0xF038, 0x9000, handle_sub_reg },  // SUB.B/W/L Dm,Dn
+    { 0xF038, 0xD000, handle_add_reg },  // ADD.B/W/L Dm,Dn
+    { 0xFFFF, 0x4E71, handle_nop },      // NOP
+    { 0xFFFF, 0x4E75, handle_rts },      // RTS
+};
+static const int num_opcodes = sizeof(instruction_table) / sizeof(OpcodeMapping);
+
+
 // Helper to set/clear status register flags
 void set_sr_flag(CPU* cpu, int flag, bool set) {
     if (set) {
@@ -68,32 +111,33 @@ uint32_t resolve_ea(CPU* cpu, uint8_t ea_field, int size_code) {
     uint8_t mode = (ea_field >> 3) & 0x7;
     uint8_t reg = ea_field & 0x7;
     uint32_t address;
-    int increment = 0;
+    int increment = (size_code == 0) ? 1 : (size_code == 1) ? 2 : 4;
+    if (reg == 7 && (mode == 3 || mode == 4) && size_code == 0) increment = 2;
 
-    if (size_code == 0) increment = 1; // Byte
-    else if (size_code == 1) increment = 2; // Word
-    else increment = 4; // Long
-    if (reg == 7 && (mode == 3 || mode == 4)) { // A7 with pre/post is always 2 for byte
-        if (size_code == 0) increment = 2;
-    }
     switch (mode) {
-        case 2: // (An)
-            return cpu->a[reg];
-        case 3: // (An)+
-            address = cpu->a[reg];
-            cpu->a[reg] += increment;
-            return address;
-        case 4: // -(An)
-            cpu->a[reg] -= increment;
-            return cpu->a[reg];
-        case 5: // d16(An)
-            {
-                int16_t displacement = (int16_t)mem_read_word(cpu->pc);
-                cpu->pc += 2;
-                return cpu->a[reg] + displacement;
+        case 2: return cpu->a[reg]; // (An)
+        case 3: address = cpu->a[reg]; cpu->a[reg] += increment; return address; // (An)+
+        case 4: cpu->a[reg] -= increment; return cpu->a[reg]; // -(An)
+        case 5: { // d16(An)
+            int16_t displacement = (int16_t)mem_read_word(cpu->pc);
+            cpu->pc += 2;
+            return cpu->a[reg] + displacement;
+        }
+        case 7: // Special modes
+            switch (reg) {
+                case 0: { // Absolute Short
+                    uint32_t addr = (int32_t)(int16_t)mem_read_word(cpu->pc);
+                    cpu->pc += 2;
+                    return addr;
+                }
+                case 1: { // Absolute Long
+                    uint32_t addr = mem_read_long(cpu->pc);
+                    cpu->pc += 4;
+                    return addr;
+                }
             }
     }
-    return 0; // Should not happen for these modes
+    return 0; // Should not happen for valid memory modes
 }
 
 // Reads a value from an effective address
@@ -162,12 +206,332 @@ void write_to_ea(CPU* cpu, uint8_t ea_field, uint32_t value, int size_code) {
     }
 }
 
+// --- Instruction Handler Implementations ---
+
+static void handle_move_b(CPU* cpu, uint16_t opcode) {
+    uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
+    uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
+    uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
+    uint8_t src_ea = opcode & 0x3F;
+    uint32_t value = read_from_ea(cpu, src_ea, 0); // 0=Byte
+    write_to_ea(cpu, dest_ea, value, 0);
+    set_sr_flag(cpu, SR_V, false);
+    set_sr_flag(cpu, SR_C, false);
+    set_logic_flags(cpu, value, 0);
+}
+
+static void handle_move_l(CPU* cpu, uint16_t opcode) {
+    uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
+    uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
+    uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
+    uint8_t src_ea = opcode & 0x3F;
+    uint32_t value = read_from_ea(cpu, src_ea, 2); // 2=Long
+
+    if (dest_ea_mode == 1) { // Destination is An (MOVEA.L)
+        write_to_ea(cpu, dest_ea, value, 2);
+        // MOVEA does not affect flags
+    } else { // Destination is not An (MOVE.L)
+        write_to_ea(cpu, dest_ea, value, 2);
+        set_sr_flag(cpu, SR_V, false);
+        set_sr_flag(cpu, SR_C, false);
+        set_logic_flags(cpu, value, 2);
+    }
+}
+
+static void handle_move_w(CPU* cpu, uint16_t opcode) {
+    uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
+    uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
+    uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
+    uint8_t src_ea = opcode & 0x3F;
+    uint32_t value = read_from_ea(cpu, src_ea, 1); // 1=Word
+
+    if (dest_ea_mode == 1) { // Destination is An (MOVEA.W)
+        // Word moves to An are sign-extended, so write as Long
+        write_to_ea(cpu, dest_ea, (int32_t)(int16_t)value, 2);
+        // MOVEA does not affect flags
+    } else { // Destination is not An (MOVE.W)
+        write_to_ea(cpu, dest_ea, value, 1);
+        set_sr_flag(cpu, SR_V, false);
+        set_sr_flag(cpu, SR_C, false);
+        set_logic_flags(cpu, value, 1);
+    }
+}
+
+static void handle_subq(CPU* cpu, uint16_t opcode) {
+    int data = (opcode >> 9) & 0x7;
+    if (data == 0) data = 8;
+    int size_code = (opcode >> 6) & 0x3;
+    int reg_num = opcode & 0x7;
+
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t result;
+
+    if (size_code == 0) { // Byte
+        uint8_t val = reg_val & 0xFF;
+        result = val - data;
+        cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
+        set_flags(cpu, data, val, result, 0, true);
+    } else if (size_code == 1) { // Word
+        uint16_t val = reg_val & 0xFFFF;
+        result = val - data;
+        cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
+        set_flags(cpu, data, val, result, 1, true);
+    } else { // Long
+        result = reg_val - data;
+        cpu->d[reg_num] = result;
+        set_flags(cpu, data, reg_val, result, 2, true);
+    }
+}
+
+static void handle_subi(CPU* cpu, uint16_t opcode) {
+    int size_code = (opcode >> 6) & 0x3;
+    int reg_num = opcode & 0x7;
+    
+    uint32_t data;
+    if (size_code == 0) { data = mem_read_word(cpu->pc) & 0xFF; cpu->pc += 2; }
+    else if (size_code == 1) { data = mem_read_word(cpu->pc); cpu->pc += 2; }
+    else { data = mem_read_long(cpu->pc); cpu->pc += 4; }
+
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t result;
+
+    if (size_code == 0) { // Byte
+        uint8_t val = reg_val & 0xFF;
+        result = val - (data & 0xFF);
+        cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
+        set_flags(cpu, data, val, result, 0, true);
+    } else if (size_code == 1) { // Word
+        uint16_t val = reg_val & 0xFFFF;
+        result = val - (data & 0xFFFF);
+        cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
+        set_flags(cpu, data, val, result, 1, true);
+    } else { // Long
+        result = reg_val - data;
+        cpu->d[reg_num] = result;
+        set_flags(cpu, data, reg_val, result, 2, true);
+    }
+}
+
+static void handle_sub_reg(CPU* cpu, uint16_t opcode) {
+    int src_reg = opcode & 0x7;
+    int dest_reg = (opcode >> 9) & 0x7;
+    int size_field = (opcode >> 6) & 0x3; // 0=B, 1=W, 2=L
+
+    uint32_t src_val = cpu->d[src_reg];
+    uint32_t dest_val = cpu->d[dest_reg];
+    uint32_t result;
+
+    if (size_field == 0) { // Byte
+        uint8_t s = src_val & 0xFF;
+        uint8_t d = dest_val & 0xFF;
+        result = d - s;
+        cpu->d[dest_reg] = (dest_val & 0xFFFFFF00) | (result & 0xFF);
+        set_flags(cpu, s, d, result, 0, true);
+    } else if (size_field == 1) { // Word
+        uint16_t s = src_val & 0xFFFF;
+        uint16_t d = dest_val & 0xFFFF;
+        result = d - s;
+        cpu->d[dest_reg] = (dest_val & 0xFFFF0000) | (result & 0xFFFF);
+        set_flags(cpu, s, d, result, 1, true);
+    } else { // Long
+        result = dest_val - src_val;
+        cpu->d[dest_reg] = result;
+        set_flags(cpu, src_val, dest_val, result, 2, true);
+    }
+}
+
+static void handle_add_reg(CPU* cpu, uint16_t opcode) {
+    int src_reg = opcode & 0x7;
+    int dest_reg = (opcode >> 9) & 0x7;
+    int opmode = (opcode >> 6) & 0x3; // 0=B, 1=W, 2=L
+    
+    uint32_t src_val = cpu->d[src_reg];
+    uint32_t dest_val = cpu->d[dest_reg];
+    uint32_t result;
+
+    if (opmode == 0) { // Byte
+        uint8_t s = src_val & 0xFF;
+        uint8_t d = dest_val & 0xFF;
+        result = d + s;
+        cpu->d[dest_reg] = (dest_val & 0xFFFFFF00) | (result & 0xFF);
+        set_flags(cpu, s, d, result, 0, false);
+    } else if (opmode == 1) { // Word
+        uint16_t s = src_val & 0xFFFF;
+        uint16_t d = dest_val & 0xFFFF;
+        result = d + s;
+        cpu->d[dest_reg] = (dest_val & 0xFFFF0000) | (result & 0xFFFF);
+        set_flags(cpu, s, d, result, 1, false);
+    } else { // Long
+        result = dest_val + src_val;
+        cpu->d[dest_reg] = result;
+        set_flags(cpu, src_val, dest_val, result, 2, false);
+    }
+}
+
+static void handle_addq(CPU* cpu, uint16_t opcode) {
+    int data = (opcode >> 9) & 0x7;
+    if (data == 0) data = 8;
+    int size_code = (opcode >> 6) & 0x3;
+    int reg_num = opcode & 0x7;
+
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t result;
+    
+    if (size_code == 0) { // Byte
+        uint8_t val = reg_val & 0xFF;
+        result = val + data;
+        cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
+        set_flags(cpu, data, val, result, 0, false);
+    } else if (size_code == 1) { // Word
+        uint16_t val = reg_val & 0xFFFF;
+        result = val + data;
+        cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
+        set_flags(cpu, data, val, result, 1, false);
+    } else { // Long
+        result = reg_val + data;
+        cpu->d[reg_num] = result;
+        set_flags(cpu, data, reg_val, result, 2, false);
+    }
+}
+
+static void handle_addi(CPU* cpu, uint16_t opcode) {
+    int size_code = (opcode >> 6) & 0x3;
+    int reg_num = opcode & 0x7;
+    
+    uint32_t data;
+    if (size_code == 0) { data = mem_read_word(cpu->pc) & 0xFF; cpu->pc += 2; }
+    else if (size_code == 1) { data = mem_read_word(cpu->pc); cpu->pc += 2; }
+    else { data = mem_read_long(cpu->pc); cpu->pc += 4; }
+
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t result;
+
+    if (size_code == 0) { // Byte
+        uint8_t val = reg_val & 0xFF;
+        result = val + (data & 0xFF);
+        cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
+        set_flags(cpu, data, val, result, 0, false);
+    } else if (size_code == 1) { // Word
+        uint16_t val = reg_val & 0xFFFF;
+        result = val + (data & 0xFFFF);
+        cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
+        set_flags(cpu, data, val, result, 1, false);
+    } else { // Long
+        result = reg_val + data;
+        cpu->d[reg_num] = result;
+        set_flags(cpu, data, reg_val, result, 2, false);
+    }
+}
+
+static void handle_andi(CPU* cpu, uint16_t opcode) {
+    int size_code = (opcode >> 6) & 0x3;
+    int reg_num = opcode & 0x7;
+    
+    uint32_t data;
+    if (size_code == 0) { data = mem_read_word(cpu->pc) & 0xFF; cpu->pc += 2; }
+    else if (size_code == 1) { data = mem_read_word(cpu->pc); cpu->pc += 2; }
+    else { data = mem_read_long(cpu->pc); cpu->pc += 4; }
+
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t result;
+
+    if (size_code == 0) { result = (reg_val & 0xFF) & (data & 0xFF); cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | result; }
+    else if (size_code == 1) { result = (reg_val & 0xFFFF) & (data & 0xFFFF); cpu->d[reg_num] = (reg_val & 0xFFFF0000) | result; }
+    else { result = reg_val & data; cpu->d[reg_num] = result; }
+    
+    set_logic_flags(cpu, result, size_code);
+}
+
+static void handle_btst_imm(CPU* cpu, uint16_t opcode) {
+    int reg_num = opcode & 0x7;
+    uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
+    cpu->pc += 2;
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t mask = 1 << (bit_num % 32);
+    set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
+}
+
+static void handle_bchg_imm(CPU* cpu, uint16_t opcode) {
+    int reg_num = opcode & 0x7;
+    uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
+    cpu->pc += 2;
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t mask = 1 << (bit_num % 32);
+    set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
+    cpu->d[reg_num] = reg_val ^ mask;
+}
+
+static void handle_bclr_imm(CPU* cpu, uint16_t opcode) {
+    int reg_num = opcode & 0x7;
+    uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
+    cpu->pc += 2;
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t mask = 1 << (bit_num % 32);
+    set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
+    cpu->d[reg_num] = reg_val & ~mask;
+}
+
+static void handle_bset_imm(CPU* cpu, uint16_t opcode) {
+    int reg_num = opcode & 0x7;
+    uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
+    cpu->pc += 2;
+    uint32_t reg_val = cpu->d[reg_num];
+    uint32_t mask = 1 << (bit_num % 32);
+    set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
+    cpu->d[reg_num] = reg_val | mask;
+}
+
+static void handle_bcc(CPU* cpu, uint16_t opcode) {
+    uint32_t current_pc = cpu->pc - 2; // The PC was already advanced past the opcode
+    int condition = (opcode >> 8) & 0xF;
+    int8_t displacement = opcode & 0xFF;
+    bool branch = false;
+    bool z = (cpu->sr >> SR_Z) & 1;
+    bool n = (cpu->sr >> SR_N) & 1;
+    bool v = (cpu->sr >> SR_V) & 1;
+    bool c = (cpu->sr >> SR_C) & 1;
+
+    switch (condition) {
+        case 0x0: branch = true; break; // BRA
+        case 0x2: branch = !c && !z; break; // BHI
+        case 0x3: branch = c || z; break; // BLS
+        case 0x4: branch = !c; break; // BCC
+        case 0x5: branch = c; break; // BCS
+        case 0x6: branch = !z; break; // BNE
+        case 0x7: branch = z; break; // BEQ
+        case 0x8: branch = !v; break; // BVC
+        case 0x9: branch = v; break; // BVS
+        case 0xA: branch = !n; break; // BPL
+        case 0xB: branch = n; break; // BMI
+        case 0xC: branch = (n && v) || (!n && !v); break; // BGE
+        case 0xD: branch = (n && !v) || (!n && v); break; // BLT
+        case 0xE: branch = (n && v && !z) || (!n && !v && !z); break; // BGT
+        case 0xF: branch = z || (n && !v) || (!n && v); break; // BLE
+    }
+
+    if (branch) {
+        cpu->pc = current_pc + 2 + displacement;
+    }
+}
+
+static void handle_nop(CPU* cpu, uint16_t opcode) {
+    (void)cpu;    // Silence unused parameter warning
+    (void)opcode; // Silence unused parameter warning
+}
+
+static void handle_rts(CPU* cpu, uint16_t opcode) {
+    (void)cpu;    // Silence unused parameter warning
+    (void)opcode; // Silence unused parameter warning
+    // In the future, this will pop the return address from the stack.
+}
+
+// --- Main Execution Loop ---
+
 void execute_program(CPU* cpu) {
     printf("INFO: Beginning execution from 0x%X.\n\n", cpu->pc);
     bool running = true;
     int cycles = 0;
 
-    // Print initial state before first instruction
     printf("%-26s | ", "Initial State");
     cpu_dump_registers(cpu);
 
@@ -178,403 +542,25 @@ void execute_program(CPU* cpu) {
         uint16_t opcode = mem_read_word(cpu->pc);
         cpu->pc += 2;
 
-        // Handler for MOVE.B
-        if ((opcode & 0xF000) == 0x1000) {
-            uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
-            uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
-            uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
-            uint8_t src_ea = opcode & 0x3F;
-            uint32_t value = read_from_ea(cpu, src_ea, 0); // 0=Byte
-            write_to_ea(cpu, dest_ea, value, 0);
-            set_sr_flag(cpu, SR_V, false);
-            set_sr_flag(cpu, SR_C, false);
-            set_logic_flags(cpu, value, 0);
-        
-        // Handler for MOVE.L and MOVEA.L
-        } else if ((opcode & 0xF000) == 0x2000) {
-            uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
-            uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
-            uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
-            uint8_t src_ea = opcode & 0x3F;
-            uint32_t value = read_from_ea(cpu, src_ea, 2); // 2=Long
-
-            if (dest_ea_mode == 1) { // Destination is An (MOVEA.L)
-                write_to_ea(cpu, dest_ea, value, 2);
-                // MOVEA does not affect flags
-            } else { // Destination is not An (MOVE.L)
-                write_to_ea(cpu, dest_ea, value, 2);
-                set_sr_flag(cpu, SR_V, false);
-                set_sr_flag(cpu, SR_C, false);
-                set_logic_flags(cpu, value, 2);
-            }
-
-        // Handler for MOVE.W and MOVEA.W
-        } else if ((opcode & 0xF000) == 0x3000) {
-            uint8_t dest_ea_mode = (opcode >> 6) & 0x7;
-            uint8_t dest_ea_reg = (opcode >> 9) & 0x7;
-            uint8_t dest_ea = (dest_ea_mode << 3) | dest_ea_reg;
-            uint8_t src_ea = opcode & 0x3F;
-            uint32_t value = read_from_ea(cpu, src_ea, 1); // 1=Word
-
-            if (dest_ea_mode == 1) { // Destination is An (MOVEA.W)
-                // Word moves to An are sign-extended, so write as Long
-                write_to_ea(cpu, dest_ea, (int32_t)(int16_t)value, 2);
-                // MOVEA does not affect flags
-            } else { // Destination is not An (MOVE.W)
-				write_to_ea(cpu, dest_ea, value, 1);
-                set_sr_flag(cpu, SR_V, false);
-                set_sr_flag(cpu, SR_C, false);
-                set_logic_flags(cpu, value, 1);
-            }
-
-        } else if (opcode == 0x4E71) { // NOP
-            // Do nothing.
-        } else if ((opcode & 0xF138) == 0x5100) { // SUBQ #imm,Dn
-            int data = (opcode >> 9) & 0x7;
-            if (data == 0) data = 8;
-            int size_code = (opcode >> 6) & 0x3;
-            int reg_num = opcode & 0x7;
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t result;
-
-            if (size_code == 0) { // Byte
-                uint8_t val = reg_val & 0xFF;
-                result = val - data;
-                cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
-                set_flags(cpu, data, val, result, 0, true);
-            } else if (size_code == 1) { // Word
-                uint16_t val = reg_val & 0xFFFF;
-                result = val - data;
-                cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
-                set_flags(cpu, data, val, result, 1, true);
-            } else if (size_code == 2) { // Long
-                result = reg_val - data;
-                cpu->d[reg_num] = result;
-                set_flags(cpu, data, reg_val, result, 2, true);
-            }
-        } else if ((opcode & 0xFF38) == 0x0400) { // SUBI #<data>,Dn
-            int size_code = (opcode >> 6) & 0x3;
-            int reg_num = opcode & 0x7;
-            
-            uint32_t data;
-            if (size_code == 0) { // Byte
-                data = mem_read_word(cpu->pc) & 0xFF;
-                cpu->pc += 2;
-            } else if (size_code == 1) { // Word
-                data = mem_read_word(cpu->pc);
-                cpu->pc += 2;
-            } else { // Long
-                data = mem_read_long(cpu->pc);
-                cpu->pc += 4;
-            }
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t result;
-
-            if (size_code == 0) { // Byte
-                uint8_t val = reg_val & 0xFF;
-                result = val - (data & 0xFF);
-                cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
-                set_flags(cpu, data, val, result, 0, true);
-            } else if (size_code == 1) { // Word
-                uint16_t val = reg_val & 0xFFFF;
-                result = val - (data & 0xFFFF);
-                cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
-                set_flags(cpu, data, val, result, 1, true);
-            } else { // Long
-                result = reg_val - data;
-                cpu->d[reg_num] = result;
-                set_flags(cpu, data, reg_val, result, 2, true);
-            }
-
-        } else if ((opcode & 0xF038) == 0x9000) { // Catches SUB.B/W/L Dm, Dn
-            int src_reg = opcode & 0x7;
-            int dest_reg = (opcode >> 9) & 0x7;
-            int size_field = (opcode >> 6) & 0x7; // 000=Byte, 001=Word, 010=Long
-
-            uint32_t src_val = cpu->d[src_reg];
-            uint32_t dest_val = cpu->d[dest_reg];
-            uint32_t result;
-
-            if (size_field == 0) { // Byte
-                uint8_t s = src_val & 0xFF;
-                uint8_t d = dest_val & 0xFF;
-                result = d - s;
-                cpu->d[dest_reg] = (dest_val & 0xFFFFFF00) | (result & 0xFF);
-                set_flags(cpu, s, d, result, 0, true);
-            } else if (size_field == 1) { // Word
-                uint16_t s = src_val & 0xFFFF;
-                uint16_t d = dest_val & 0xFFFF;
-                result = d - s;
-                cpu->d[dest_reg] = (dest_val & 0xFFFF0000) | (result & 0xFFFF);
-                set_flags(cpu, s, d, result, 1, true);
-            } else if (size_field == 2) { // Long
-                result = dest_val - src_val;
-                cpu->d[dest_reg] = result;
-                set_flags(cpu, src_val, dest_val, result, 2, true);
-            }
-        } else if ((opcode & 0xF038) == 0xD000) { // ADD Dm, Dn
-            int src_reg = opcode & 0x7;
-            int dest_reg = (opcode >> 9) & 0x7;
-            int opmode = (opcode >> 6) & 0x7; // opmode: 000=B, 001=W, 010=L
-            
-            uint32_t src_val = cpu->d[src_reg];
-            uint32_t dest_val = cpu->d[dest_reg];
-            uint32_t result;
-
-            if (opmode == 0) { // Byte
-                uint8_t s = src_val & 0xFF;
-                uint8_t d = dest_val & 0xFF;
-                result = d + s;
-                cpu->d[dest_reg] = (dest_val & 0xFFFFFF00) | (result & 0xFF);
-                set_flags(cpu, s, d, result, 0, false);
-            } else if (opmode == 1) { // Word
-                uint16_t s = src_val & 0xFFFF;
-                uint16_t d = dest_val & 0xFFFF;
-                result = d + s;
-                cpu->d[dest_reg] = (dest_val & 0xFFFF0000) | (result & 0xFFFF);
-                set_flags(cpu, s, d, result, 1, false);
-            } else if (opmode == 2) { // Long
-                result = dest_val + src_val;
-                cpu->d[dest_reg] = result;
-                set_flags(cpu, src_val, dest_val, result, 2, false);
-            }
-        } else if ((opcode & 0xF138) == 0x5000) { // ADDQ #imm,Dn
-            int data = (opcode >> 9) & 0x7;
-            if (data == 0) data = 8;
-            int size_code = (opcode >> 6) & 0x3;
-            int reg_num = opcode & 0x7;
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t result;
-            
-            if (size_code == 0) { // Byte
-                uint8_t val = reg_val & 0xFF;
-                result = val + data;
-                cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
-                set_flags(cpu, data, val, result, 0, false);
-            } else if (size_code == 1) { // Word
-                uint16_t val = reg_val & 0xFFFF;
-                result = val + data;
-                cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
-                set_flags(cpu, data, val, result, 1, false);
-            } else if (size_code == 2) { // Long
-                result = reg_val + data;
-                cpu->d[reg_num] = result;
-                set_flags(cpu, data, reg_val, result, 2, false);
-            }
-        } else if ((opcode & 0xFF38) == 0x0600) { // ADDI #<data>,Dn
-            int size_code = (opcode >> 6) & 0x3;
-            int reg_num = opcode & 0x7;
-            
-            uint32_t data;
-            if (size_code == 0) { // Byte
-                data = mem_read_word(cpu->pc) & 0xFF;
-                cpu->pc += 2;
-            } else if (size_code == 1) { // Word
-                data = mem_read_word(cpu->pc);
-                cpu->pc += 2;
-            } else { // Long
-                data = mem_read_long(cpu->pc);
-                cpu->pc += 4;
-            }
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t result;
-
-            if (size_code == 0) { // Byte
-                uint8_t val = reg_val & 0xFF;
-                result = val + (data & 0xFF);
-                cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | (result & 0xFF);
-                set_flags(cpu, data, val, result, 0, false);
-            } else if (size_code == 1) { // Word
-                uint16_t val = reg_val & 0xFFFF;
-                result = val + (data & 0xFFFF);
-                cpu->d[reg_num] = (reg_val & 0xFFFF0000) | (result & 0xFFFF);
-                set_flags(cpu, data, val, result, 1, false);
-            } else { // Long
-                result = reg_val + data;
-                cpu->d[reg_num] = result;
-                set_flags(cpu, data, reg_val, result, 2, false);
-            }
-        } else if ((opcode & 0xFF38) == 0x0200) { // ANDI #<data>,Dn
-            int size_code = (opcode >> 6) & 0x3;
-            int reg_num = opcode & 0x7;
-            
-            uint32_t data;
-            if (size_code == 0) { // Byte
-                data = mem_read_word(cpu->pc) & 0xFF;
-                cpu->pc += 2;
-            } else if (size_code == 1) { // Word
-                data = mem_read_word(cpu->pc);
-                cpu->pc += 2;
-            } else { // Long
-                data = mem_read_long(cpu->pc);
-                cpu->pc += 4;
-            }
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t result;
-
-            if (size_code == 0) { // Byte
-                result = (reg_val & 0xFF) & (data & 0xFF);
-                cpu->d[reg_num] = (reg_val & 0xFFFFFF00) | result;
-            } else if (size_code == 1) { // Word
-                result = (reg_val & 0xFFFF) & (data & 0xFFFF);
-                cpu->d[reg_num] = (reg_val & 0xFFFF0000) | result;
-            } else { // Long
-                result = reg_val & data;
-                cpu->d[reg_num] = result;
-            }
-            
-            set_logic_flags(cpu, result, size_code);
-        } else if ((opcode & 0xFFF8) == 0x0800) { // BTST #<data>,Dn
-            int reg_num = opcode & 0x7;
-            uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
-            cpu->pc += 2;
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t mask = 1 << (bit_num % 32);
-
-            set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
-        } else if ((opcode & 0xFFF8) == 0x0840) { // BCHG #<data>,Dn
-            int reg_num = opcode & 0x7;
-            uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
-            cpu->pc += 2;
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t mask = 1 << (bit_num % 32);
-
-            set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
-            
-            cpu->d[reg_num] = reg_val ^ mask;
-        } else if ((opcode & 0xFFF8) == 0x0880) { // BCLR #<data>,Dn
-            int reg_num = opcode & 0x7;
-            uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
-            cpu->pc += 2;
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t mask = 1 << (bit_num % 32);
-
-            set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
-            
-            cpu->d[reg_num] = reg_val & ~mask;
-        } else if ((opcode & 0xFFF8) == 0x08C0) { // BSET #<data>,Dn
-            int reg_num = opcode & 0x7;
-            uint8_t bit_num = mem_read_word(cpu->pc) & 0xFF;
-            cpu->pc += 2;
-
-            uint32_t reg_val = cpu->d[reg_num];
-            uint32_t mask = 1 << (bit_num % 32);
-
-            set_sr_flag(cpu, SR_Z, (reg_val & mask) == 0);
-            
-            cpu->d[reg_num] = reg_val | mask;
-        } else if ((opcode & 0xC000) == 0x0000) { // Catches MOVE.B/W/L (but not MOVEA)
-            uint16_t size_bits = (opcode >> 12) & 0x3; // 1=B, 3=W, 2=L
-            int size_code = -1;
-            if (size_bits == 1) size_code = 0; // Byte
-            if (size_bits == 3) size_code = 1; // Word
-            if (size_bits == 2) size_code = 2; // Long
-
-            if (size_code != -1) {
-                uint8_t src_ea = opcode & 0x3F;
-                uint8_t dest_ea = ((opcode >> 6) & 0x7) | (((opcode >> 9) & 0x7) << 3);
-
-                // Note: Immediate source is NOT handled by this instruction format.
-                // It's handled by specific instructions like ADDI, SUBI, ANDI, etc.
-                // Or by MOVE #imm which is a different pattern.
-                // Let's ensure this handler doesn't run for immediate sources.
-                if (src_ea != 0b111100) {
-                    uint32_t value = read_from_ea(cpu, src_ea, size_code);
-                    write_to_ea(cpu, dest_ea, value, size_code);
-                    
-                    set_sr_flag(cpu, SR_V, false);
-                    set_sr_flag(cpu, SR_C, false);
-                    set_logic_flags(cpu, value, size_code);
-                } else {
-                    // This case indicates an immediate instruction that we should have caught earlier.
-                    // If we get here, it means we have a bug in our instruction ordering or masks.
-                    printf("WARN: Unhandled immediate-style opcode: %04X\n", opcode);
-                    running = false;
-                }
-            } else {
-                 printf("WARN: Unimplemented MOVE variant: %04X\n", opcode);
-                 running = false;
-            }
-		} else if ((opcode & 0xF000) == 0x6000) { // Bcc
-            int condition = (opcode >> 8) & 0xF;
-            int8_t displacement = opcode & 0xFF;
-            bool branch = false;
-            bool z = (cpu->sr >> SR_Z) & 1;
-            bool n = (cpu->sr >> SR_N) & 1;
-            bool v = (cpu->sr >> SR_V) & 1;
-            bool c = (cpu->sr >> SR_C) & 1;
-
-            switch (condition) {
-                case 0x0: // BRA
-                    branch = true;
-                    break;
-                case 0x2: // BHI
-                    branch = !c && !z;
-                    break;
-                case 0x3: // BLS
-                    branch = c || z;
-                    break;
-                case 0x4: // BCC
-                    branch = !c;
-                    break;
-                case 0x5: // BCS
-                    branch = c;
-                    break;
-                case 0x6: // BNE
-                    branch = !z;
-                    break;
-                case 0x7: // BEQ
-                    branch = z;
-                    break;
-                case 0x8: // BVC
-                    branch = !v;
-                    break;
-                case 0x9: // BVS
-                    branch = v;
-                    break;
-                case 0xA: // BPL
-                    branch = !n;
-                    break;
-                case 0xB: // BMI
-                    branch = n;
-                    break;
-                case 0xC: // BGE
-                    branch = (n && v) || (!n && !v);
-                    break;
-                case 0xD: // BLT
-                    branch = (n && !v) || (!n && v);
-                    break;
-                case 0xE: // BGT
-                    branch = (n && v && !z) || (!n && !v && !z);
-                    break;
-                case 0xF: // BLE
-                    branch = z || (n && !v) || (!n && v);
-                    break;
-                default:
-                    // BSR is not implemented yet
-                    break;
-            }
-
-            if (branch) {
-                // The displacement is relative to the current PC, which is the address
-                // of the instruction *after* the branch instruction.
-                cpu->pc = current_pc + 2 + displacement;
-            }
-        } else if (opcode == 0x4E75) { // RTS
+        // Special case for RTS to halt simulation
+        if (opcode == 0x4E75) {
             running = false;
-        } else {
-            printf("WARN: Unknown or unimplemented opcode: %04X\n", opcode);
-            running = false; // Stop on unknown instructions
         }
 
+        bool handled = false;
+        for (int i = 0; i < num_opcodes; ++i) {
+            if ((opcode & instruction_table[i].mask) == instruction_table[i].value) {
+                instruction_table[i].handler(cpu, opcode);
+                handled = true;
+                break;
+            }
+        }
+
+        if (!handled) {
+            printf("WARN: Unknown or unimplemented opcode: %04X\n", opcode);
+            running = false;
+        }
+        
         // Print instruction and state AFTER execution
         if (map) {
             printf("L%-3d: %-20s | ", map->line_number, map->instruction_text);

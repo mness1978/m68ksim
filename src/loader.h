@@ -1,3 +1,4 @@
+    
 #ifndef LOADER_H
 #define LOADER_H
 
@@ -28,12 +29,14 @@ typedef enum {
     UNKNOWN_MODE = 0,
     DATA_REGISTER_DIRECT,       // Dn
     ADDRESS_REGISTER_DIRECT,    // An
-    // Add these new modes:
     ADDRESS_REGISTER_INDIRECT,  // (An)
     ARI_POST_INCREMENT,         // (An)+
     ARI_PRE_DECREMENT,          // -(An)
     ARI_DISPLACEMENT,           // d(An)
     IMMEDIATE,                  // #<data>
+    ABSOLUTE_SHORT,             // xxxx.W or xxxx
+    ABSOLUTE_LONG,              // xxxx.L
+    PC_RELATIVE_DISPLACEMENT    // d16(PC) or label(PC)
 } AddressingMode;
 
 // Represents a parsed operand
@@ -41,7 +44,8 @@ typedef struct {
     AddressingMode mode;
     int reg_num;                // For register modes
     uint32_t value;             // For immediate or absolute address values
-    int16_t displacement;       // Add this for d(An) mode
+    int16_t displacement;       // For d(An) mode
+    char* label;                // For unresolved labels
 } Operand;
 
 // Loads an assembly file into memory

@@ -1,0 +1,115 @@
+%value "Operand*"
+%auxil "pcc_string_input_t*"
+%header {
+#include "loader.h"
+#include "operand_parser_types.h"
+#include <stdlib.h>
+#include <string.h>
+#include <ctype.h>
+#include <stdint.h>
+#include <stdio.h> // Needed for snprintf
+
+/* --- DEBUGGING HELPERS --- */
+static const char* sprint_operand(const Operand* op) {
+    static char debug_buffer[256];
+    if (!op) { return "(null)"; }
+    char temp[128];
+    switch (op->mode) {
+        case DATA_REGISTER_DIRECT: snprintf(temp, 128, "Dn (D%d)", op->reg_num); break;
+        case ADDRESS_REGISTER_DIRECT: snprintf(temp, 128, "An (A%d)", op->reg_num); break;
+        case IMMEDIATE: 
+            if (op->label) snprintf(temp, 128, "Immediate (#%s)", op->label);
+            else snprintf(temp, 128, "Immediate (#%u)", op->value);
+            break;
+        case ADDRESS_REGISTER_INDIRECT: snprintf(temp, 128, "AR Indirect ((A%d))", op->reg_num); break;
+        case ARI_POST_INCREMENT: snprintf(temp, 128, "AR Post-Inc ((A%d)+)", op->reg_num); break;
+        case ARI_PRE_DECREMENT: snprintf(temp, 128, "AR Pre-Dec (-(A%d))", op->reg_num); break;
+        case ARI_DISPLACEMENT: snprintf(temp, 128, "AR Displacement (%d(A%d))", op->displacement, op->reg_num); break;
+        case PC_RELATIVE_DISPLACEMENT: 
+            if (op->label) snprintf(temp, 128, "PC Displacement (%s(PC))", op->label);
+            else snprintf(temp, 128, "PC Displacement (%d(PC))", op->displacement);
+            break;
+        case ABSOLUTE_SHORT: 
+            if (op->label) snprintf(temp, 128, "Absolute Short (%s)", op->label);
+            else snprintf(temp, 128, "Absolute Short ($%X)", op->value);
+            break;
+        case ABSOLUTE_LONG: 
+            if (op->label) snprintf(temp, 128, "Absolute Long (%s)", op->label);
+            else snprintf(temp, 128, "Absolute Long ($%X)", op->value);
+            break;
+        default: snprintf(temp, 128, "Unknown/Partial"); break;
+    }
+    snprintf(debug_buffer, 256, "{ mode:%d, content:[%s] }", op->mode, temp);
+    return debug_buffer;
+}
+#ifdef DEBUG_PARSER
+#define TRACE(rule) fprintf(stderr, "[PEG_TRACE] -> %s\n", rule)
+#define TRACE_SUCCESS(rule, op_ptr) fprintf(stderr, "[PEG_TRACE] <-- %s SUCCESS | %s\n", rule, sprint_operand(op_ptr))
+#else
+#define TRACE(rule)
+#define TRACE_SUCCESS(rule, op_ptr)
+#endif
+}
+%source {
+#include "operand_parser_types.h"
+static int pcc_custom_getchar(pcc_string_input_t* input) {
+    if (input->input[input->position] == '\0') return -1;
+    return (unsigned char)input->input[input->position++];
+}
+#define PCC_GETCHAR(auxil) pcc_custom_getchar(auxil)
+static char* pcc_strndup(const char *s, size_t n) {
+    char *new_s = (char*)malloc(n + 1);
+    if (new_s == NULL) return NULL;
+    memcpy(new_s, s, n);
+    new_s[n] = '\0';
+    return new_s;
+}
+static Operand* create_operand() {
+    Operand* op = (Operand*)malloc(sizeof(Operand));
+    if (op) {
+        op->mode = UNKNOWN_MODE;
+        op->reg_num = -1;
+        op->value = 0;
+        op->displacement = 0;
+        op->label = NULL;
+    }
+    return op;
+}
+}
+root <- {TRACE("root");} WHITESPACE? op:operand WHITESPACE? EOT { $$ = op; TRACE_SUCCESS("root", $$); }
+operand <- {TRACE("operand");} op:Operand_Immediate_Number { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_Immediate_Label { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_AR_PreDecrement { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_AR_PostIncrement { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_PC_Displacement_Number { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_PC_Displacement_Label { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_AR_Displacement { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_AR_Indirect { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_DataRegister { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_AddressRegister { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_Absolute_Long_Label { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_Absolute_Long_Number { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_Absolute_Short_Label { $$ = op; TRACE_SUCCESS("operand", $$); } /
+                               op:Operand_Absolute_Short_Number { $$ = op; TRACE_SUCCESS("operand", $$); }
+WHITESPACE  <- [ \t]+
+EOT         <- !.
+Identifier <- {TRACE("Identifier");} <[a-zA-Z_][a-zA-Z0-9_]*> { const pcc_capture_t *cap = pcc_in->data.leaf.capts.p[0]; $$ = create_operand(); $$->label = pcc_strndup(pcc_ctx->buffer.p + cap->range.start, cap->range.end - cap->range.start); TRACE_SUCCESS("Identifier", $$); }
+HexNumber   <- {TRACE("HexNumber");} '$' <[0-9a-fA-F]+> { const pcc_capture_t *cap = pcc_in->data.leaf.capts.p[0]; char* s = pcc_strndup(pcc_ctx->buffer.p + cap->range.start, cap->range.end - cap->range.start); $$ = create_operand(); $$->value = strtoul(s, NULL, 16); free(s); TRACE_SUCCESS("HexNumber", $$); }
+NegativeDecNumber <- {TRACE("NegativeDecNumber");} '-' <[0-9]+> { const pcc_capture_t *cap = pcc_in->data.leaf.capts.p[0]; char* s = pcc_strndup(pcc_ctx->buffer.p + cap->range.start, cap->range.end - cap->range.start); $$ = create_operand(); $$->value = -strtol(s, NULL, 10); free(s); TRACE_SUCCESS("NegativeDecNumber", $$); }
+PositiveDecNumber <- {TRACE("PositiveDecNumber");} <[0-9]+> { const pcc_capture_t *cap = pcc_in->data.leaf.capts.p[0]; char* s = pcc_strndup(pcc_ctx->buffer.p + cap->range.start, cap->range.end - cap->range.start); $$ = create_operand(); $$->value = strtol(s, NULL, 10); free(s); TRACE_SUCCESS("PositiveDecNumber", $$); }
+DecNumber   <- {TRACE("DecNumber");} val:NegativeDecNumber { $$ = val; TRACE_SUCCESS("DecNumber (neg)", $$); } / val:PositiveDecNumber { $$ = val; TRACE_SUCCESS("DecNumber (pos)", $$); }
+Number      <- {TRACE("Number");} val:HexNumber { $$ = val; TRACE_SUCCESS("Number (hex)", $$); } / val:DecNumber { $$ = val; TRACE_SUCCESS("Number (dec)", $$); }
+Operand_Immediate_Number <- {TRACE("Operand_Immediate_Number");} '#' val:Number { $$ = val; $$->mode = IMMEDIATE; TRACE_SUCCESS("Operand_Immediate_Number", $$); }
+Operand_Immediate_Label <- {TRACE("Operand_Immediate_Label");} '#' val:Identifier { $$ = val; $$->mode = IMMEDIATE; TRACE_SUCCESS("Operand_Immediate_Label", $$); }
+Operand_AR_PreDecrement <- {TRACE("Operand_AR_PreDecrement");} '-' '(' 'A' <[0-7]> ')' { $$ = create_operand(); $$->mode = ARI_PRE_DECREMENT; $$->reg_num = pcc_ctx->buffer.p[pcc_in->data.leaf.capts.p[0]->range.start] - '0'; TRACE_SUCCESS("Operand_AR_PreDecrement", $$); }
+Operand_AR_PostIncrement <- {TRACE("Operand_AR_PostIncrement");} '(' 'A' <[0-7]> ')' '+' { $$ = create_operand(); $$->mode = ARI_POST_INCREMENT; $$->reg_num = pcc_ctx->buffer.p[pcc_in->data.leaf.capts.p[0]->range.start] - '0'; TRACE_SUCCESS("Operand_AR_PostIncrement", $$); }
+Operand_AR_Displacement <- {TRACE("Operand_AR_Displacement");} disp:Number '(' 'A' <[0-7]> ')' { $$ = create_operand(); $$->mode = ARI_DISPLACEMENT; $$->displacement = disp->value; $$->reg_num = pcc_ctx->buffer.p[pcc_in->data.leaf.capts.p[0]->range.start] - '0'; free(disp); TRACE_SUCCESS("Operand_AR_Displacement", $$); }
+Operand_PC_Displacement_Number <- {TRACE("Operand_PC_Displacement_Number");} disp:Number '(' 'PC' ')' { $$ = disp; $$->mode = PC_RELATIVE_DISPLACEMENT; $$->displacement = $$->value; TRACE_SUCCESS("Operand_PC_Displacement_Number", $$); }
+Operand_PC_Displacement_Label <- {TRACE("Operand_PC_Displacement_Label");} disp:Identifier '(' 'PC' ')' { $$ = disp; $$->mode = PC_RELATIVE_DISPLACEMENT; TRACE_SUCCESS("Operand_PC_Displacement_Label", $$); }
+Operand_AR_Indirect <- {TRACE("Operand_AR_Indirect");} '(' 'A' <[0-7]> ')' { $$ = create_operand(); $$->mode = ADDRESS_REGISTER_INDIRECT; $$->reg_num = pcc_ctx->buffer.p[pcc_in->data.leaf.capts.p[0]->range.start] - '0'; TRACE_SUCCESS("Operand_AR_Indirect", $$); }
+Operand_DataRegister <- {TRACE("Operand_DataRegister");} 'D' <[0-7]> { $$ = create_operand(); $$->mode = DATA_REGISTER_DIRECT; $$->reg_num = pcc_ctx->buffer.p[pcc_in->data.leaf.capts.p[0]->range.start] - '0'; TRACE_SUCCESS("Operand_DataRegister", $$); }
+Operand_AddressRegister <- {TRACE("Operand_AddressRegister");} 'A' <[0-7]> { $$ = create_operand(); $$->mode = ADDRESS_REGISTER_DIRECT; $$->reg_num = pcc_ctx->buffer.p[pcc_in->data.leaf.capts.p[0]->range.start] - '0'; TRACE_SUCCESS("Operand_AddressRegister", $$); }
+Operand_Absolute_Long_Number <- {TRACE("Operand_Absolute_Long_Number");} val:Number ('.l' / '.L') { $$ = val; $$->mode = ABSOLUTE_LONG; TRACE_SUCCESS("Operand_Absolute_Long_Number", $$); }
+Operand_Absolute_Long_Label <- {TRACE("Operand_Absolute_Long_Label");} val:Identifier ('.l' / '.L') { $$ = val; $$->mode = ABSOLUTE_LONG; TRACE_SUCCESS("Operand_Absolute_Long_Label", $$); }
+Operand_Absolute_Short_Number <- {TRACE("Operand_Absolute_Short_Number");} val:Number !('.' ('l' / 'L')) { $$ = val; $$->mode = ABSOLUTE_SHORT; TRACE_SUCCESS("Operand_Absolute_Short_Number", $$); }
+Operand_Absolute_Short_Label <- {TRACE("Operand_Absolute_Short_Label");} val:Identifier !('.' ('l' / 'L')) { $$ = val; $$->mode = ABSOLUTE_SHORT; TRACE_SUCCESS("Operand_Absolute_Short_Label", $$); }
