@@ -106,15 +106,76 @@ void set_logic_flags(CPU* cpu, uint32_t result, int size_code) {
     }
 }
 
-// Resolves an effective address, returns the final address, and handles pre/post operations
+// Decodes a 68020+ full format extension word and computes the address
+uint32_t resolve_full_format_ea(CPU* cpu, uint32_t base_reg_val, uint16_t extension_word) {
+    // 1. Decode all fields from the extension word
+    bool index_is_an      = (extension_word >> 15) & 1;
+    int index_reg_num     = (extension_word >> 12) & 7;
+    bool index_is_long    = (extension_word >> 11) & 1;
+    int scale             = (extension_word >> 9) & 3;
+    int bd_size_code      = (extension_word >> 4) & 3;
+    int iis               = extension_word & 7;
+
+    // 2. Read Base Displacement (BD) from instruction stream if present
+    int32_t base_disp = 0;
+    if (bd_size_code == 2) { base_disp = (int16_t)mem_read_word(cpu->pc); cpu->pc += 2; }
+    else if (bd_size_code == 3) { base_disp = mem_read_long(cpu->pc); cpu->pc += 4; }
+
+    // 3. Get the scaled index register value
+    uint32_t index_val = index_is_an ? cpu->a[index_reg_num] : cpu->d[index_reg_num];
+    if (!index_is_long) { index_val = (int32_t)(int16_t)index_val; }
+    uint32_t scaled_index = index_val << scale;
+
+    // 4. Calculate the Final Address
+    uint32_t final_ea = 0;
+    
+    // Step A: Calculate the base address
+    uint32_t temp_addr = base_reg_val + base_disp;
+
+    // Step B: Determine if we are doing pre-indexed or post-indexed indirection
+    bool pre_indexed = (iis == 0b001 || iis == 0b010 || iis == 0b011);
+    bool post_indexed = (iis == 0b101 || iis == 0b110 || iis == 0b111);
+
+    if (pre_indexed) {
+        // Add index *before* the memory fetch
+        final_ea = mem_read_long(temp_addr + scaled_index);
+    } else if (post_indexed) {
+        // Add index *after* the memory fetch
+        final_ea = mem_read_long(temp_addr) + scaled_index;
+    } else {
+        // No indirection (iis == 0b000)
+        final_ea = temp_addr + scaled_index;
+    }
+    
+    // 5. Read and add Outer Displacement (OD) if present
+    int32_t outer_disp = 0;
+    bool od_is_present = (iis == 0b010 || iis == 0b011 || iis == 0b110 || iis == 0b111);
+    
+    if (od_is_present) {
+        // OD size is determined by bit 2 of the iis field
+        bool od_is_long = (iis & 1) != 0; // Bit 0 of iis
+        if (od_is_long) {
+             outer_disp = mem_read_long(cpu->pc); cpu->pc += 4;
+        } else { // Word OD
+             outer_disp = (int16_t)mem_read_word(cpu->pc); cpu->pc += 2;
+        }
+        final_ea += outer_disp;
+    }
+
+    return final_ea;
+}
+
+
 uint32_t resolve_ea(CPU* cpu, uint8_t ea_field, int size_code) {
     uint8_t mode = (ea_field >> 3) & 0x7;
     uint8_t reg = ea_field & 0x7;
     uint32_t address;
     int increment = (size_code == 0) ? 1 : (size_code == 1) ? 2 : 4;
-    if (reg == 7 && (mode == 3 || mode == 4) && size_code == 0) increment = 2;
+    if (reg == 7 && (mode == 3 || mode == 4) && size_code == 0) increment = 2; // A7 special case for byte
 
     switch (mode) {
+        case 0: return 0; // Data Register Direct, not an address
+        case 1: return 0; // Address Register Direct, not an address
         case 2: return cpu->a[reg]; // (An)
         case 3: address = cpu->a[reg]; cpu->a[reg] += increment; return address; // (An)+
         case 4: cpu->a[reg] -= increment; return cpu->a[reg]; // -(An)
@@ -122,6 +183,22 @@ uint32_t resolve_ea(CPU* cpu, uint8_t ea_field, int size_code) {
             int16_t displacement = (int16_t)mem_read_word(cpu->pc);
             cpu->pc += 2;
             return cpu->a[reg] + displacement;
+        }
+        case 6: { // d8(An, Xn) or 68020+ full format
+            uint16_t extension_word = mem_read_word(cpu->pc);
+            cpu->pc += 2;
+            
+            if (extension_word & 0x0100) { // 68020+ Full Format
+                return resolve_full_format_ea(cpu, cpu->a[reg], extension_word);
+            } else { // 68000 Brief Format d8(An,Xn)
+                bool index_is_an = (extension_word >> 15) & 1;
+                int index_reg_num = (extension_word >> 12) & 7;
+                bool index_is_long = (extension_word >> 11) & 1;
+                uint32_t index_val = index_is_an ? cpu->a[index_reg_num] : cpu->d[index_reg_num];
+                if (!index_is_long) index_val = (int32_t)(int16_t)index_val; // Sign-extend if word
+                int8_t displacement = extension_word & 0xFF;
+                return cpu->a[reg] + index_val + displacement;
+            }
         }
         case 7: // Special modes
             switch (reg) {
@@ -135,27 +212,50 @@ uint32_t resolve_ea(CPU* cpu, uint8_t ea_field, int size_code) {
                     cpu->pc += 4;
                     return addr;
                 }
+                case 2: { // d16(PC)
+                    uint32_t base_pc = cpu->pc; // PC is at the extension word
+                    int16_t displacement = (int16_t)mem_read_word(cpu->pc);
+                    cpu->pc += 2;
+                    return base_pc + displacement;
+                }
+                case 3: { // d8(PC, Xn) or 68020+ full format
+                    uint32_t base_pc = cpu->pc; // PC is at the extension word
+                    uint16_t extension_word = mem_read_word(cpu->pc);
+                    cpu->pc += 2;
+
+                    if (extension_word & 0x0100) { // 68020+ Full Format
+                        return resolve_full_format_ea(cpu, base_pc, extension_word);
+                    } else { // 68000 Brief Format d8(PC,Xn)
+                        bool index_is_an = (extension_word >> 15) & 1;
+                        int index_reg_num = (extension_word >> 12) & 7;
+                        bool index_is_long = (extension_word >> 11) & 1;
+                        uint32_t index_val = index_is_an ? cpu->a[index_reg_num] : cpu->d[index_reg_num];
+                        if (!index_is_long) index_val = (int32_t)(int16_t)index_val; // Sign-extend
+                        int8_t displacement = extension_word & 0xFF;
+                        return base_pc + index_val + displacement;
+                    }
+                }
+                case 4: return 0; // Immediate, not an address
             }
     }
     return 0; // Should not happen for valid memory modes
 }
 
-// Reads a value from an effective address
+
 uint32_t read_from_ea(CPU* cpu, uint8_t ea_field, int size_code) {
     uint8_t mode = (ea_field >> 3) & 0x7;
     uint8_t reg = ea_field & 0x7;
 
-    // The special EA field for Immediate is Mode=7, Reg=4
 	if (mode == 7 && reg == 4) { // Immediate
         uint32_t data;
         if (size_code == 2) { // Long
             data = mem_read_long(cpu->pc);
             cpu->pc += 4;
-        } else { // Byte or Word
+        } else { // Byte or Word, reads a word, upper byte is ignored for .B
             data = mem_read_word(cpu->pc);
             cpu->pc += 2;
         }
-		return data; // Return the full data read
+		return data;
     }
 
     switch (mode) {
@@ -173,7 +273,7 @@ uint32_t read_from_ea(CPU* cpu, uint8_t ea_field, int size_code) {
     }
 }
 
-// Writes a value to an effective addres
+// write_to_ea remains largely the same, but it will now work with the new resolve_ea
 void write_to_ea(CPU* cpu, uint8_t ea_field, uint32_t value, int size_code) {
     uint8_t mode = (ea_field >> 3) & 0x7;
     uint8_t reg = ea_field & 0x7;
@@ -189,8 +289,10 @@ void write_to_ea(CPU* cpu, uint8_t ea_field, uint32_t value, int size_code) {
             }
             break;
         case 1: // An - Address Register Direct
-            if (size_code == 1) { // Word
-                // Word writes to An are sign-extended to 32 bits
+             if (size_code == 0) { // MOVEA.B is not a valid instruction
+                break;
+             }
+             if (size_code == 1) { // Word
                 cpu->a[reg] = (int32_t)(int16_t)value;
             } else { // Long
                 cpu->a[reg] = value;
@@ -198,6 +300,7 @@ void write_to_ea(CPU* cpu, uint8_t ea_field, uint32_t value, int size_code) {
             break;
         default: // All other memory-based modes
             {
+                // Note: Pre-decrement for write happens in resolve_ea
                 uint32_t address = resolve_ea(cpu, ea_field, size_code);
                 if (size_code == 0) mem_write_byte(address, value);
                 else if (size_code == 1) mem_write_word(address, value);
